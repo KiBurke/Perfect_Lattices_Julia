@@ -2,12 +2,11 @@ using Oscar
 using LinearAlgebra
 using Printf
 import Transducers #For parallelization
-using Distributed #To avoid a Sympol memory leak
 
-#v0.1.0
+#v0.1.1
 
 #Tools for computing perfect lattices over CM/Totally real number fields.  Work in Progress.
-#Written for Oscar v1.6.0 - due to the use of internal functions in Hecke.jl, compatibility with
+#Written for a dev version of Oscar v1.7.0 - due to the use of internal functions in Hecke.jl, compatibility with
 #other versions is not guaranteed.
 
 #Special thanks to the authors of Hecke.jl - https://github.com/thofma/Hecke.jl - The code used
@@ -540,48 +539,6 @@ function form_to_lattice_abs(q::AbstractAlgebra.Generic.MatSpaceElem{T}, V::Humb
     end
 end
 
-
-#This was a nightmare
-function perfect_cone_normals_2(q::AbstractAlgebra.Generic.MatSpaceElem{T},V::ComplexHumbertSpace) where T <: NumFieldElem
-    vgens = perfect_cone_generators(q,V)
-    @printf " | Rays: %i " length(vgens)
-    conegens = [humbert_to_mat(r,V.field) for r in vgens]
-    gs = automorphism_group_generators(hermitian_lattice(V.field.c, gram = q))
-    rgs = [[transpose(map(V.field.bar,g))*r*g for r in conegens] for g in gs]
-    #use rgs to make permutations
-    ps = [indexin(conegens,rg) for rg in rgs]
-    ps = [[x-1 for x in v] for v in ps]
-    pa = Polymake.group.PermutationAction(GENERATORS = ps)
-    G = Polymake.group.Group(RAYS_ACTION = pa)
-    #Very specific typing necessary:
-    genmat = convert(Polymake.LibPolymake.MatrixAllocated{Polymake.LibPolymake.Rational},Polymake.Matrix(permutedims(stack(vgens))))
-    #We force the input rays to be extremals - the only way to get the next function to work as far as I could figure out
-    #Luckily, they are indeed guaranteed to be extremals
-    c = Polymake.polytope.Cone(RAYS = genmat, GROUP = G)
-    normals = eachrow(matrix(QQ,Polymake.polytope.representation_conversion_up_to_symmetry(c)))
-    @printf(" | Orbits: %i ", length(normals))
-    #return normals
-    #These normals are w.r.t the standard inner product on R^n.  Here is a bodged conversion
-    #Can't nec do a change of basis because the cholesky of V.space.gram has no reason to have rational entries 
-    #TODO proper change of base - could maybe scale all the rows separately to make it work?
-    #Test which rays are in each facet: 
-    my_is_perp = X -> (Y->dot(X,Y)==0)
-    indices_in_facets = Vector{Vector{Int64}}(undef,length(normals))
-    for i in eachindex(normals)
-        indices_in_facets[i] = findall(my_is_perp(normals[i]),vgens)
-    end
-    #Make the normals with the correct inner product
-    fnorms = [orthogonal_complement(V.space,matrix(QQ,transpose(stack(vgens[inds]))))[1,:] for inds in indices_in_facets]
-    #Get the right direction:
-    for i in eachindex(fnorms)
-        j = findfirst(!in(indices_in_facets[i]),eachindex(vgens))
-        fnorms[i] = sign(dot(vgens[j],V.space.gram,fnorms[i]))*fnorms[i]
-
-    end
-    fnorms = [humbert_to_mat(f,V.field) for f in fnorms]
-    return fnorms
-end
-
 #This was a nightmare:
 
 "Given a form in `V` with matrix `q`, determine the normals of the cone of `q` up to `aut(q)`.
@@ -601,17 +558,48 @@ function perfect_cone_normals(q::AbstractAlgebra.Generic.MatSpaceElem{T},V::Humb
     end
     #Use rgs to make permutations
     ps = [indexin(conegens,rg) for rg in rgs]
+    #GC.enable(false)
     ps = [[x-1 for x in v] for v in ps]
+    
+    #println("action:")
     pa = Polymake.group.PermutationAction(GENERATORS = ps)
+    #println("group:")
     G = Polymake.group.Group(RAYS_ACTION = pa)
     #Very specific typing necessary:
-    genmat = convert(Polymake.LibPolymake.MatrixAllocated{Polymake.LibPolymake.Rational},
-        Polymake.Matrix(permutedims(stack(vgens))))
+    #genmat = convert(Polymake.LibPolymake.MatrixAllocated{Polymake.LibPolymake.Rational},
+        #Polymake.Matrix(permutedims(stack(vgens))))
+    #println("mat:")
+    genmat = Polymake.Matrix(permutedims(stack(vgens)))
+
+    
     #We must force the input rays to be extremals to get the next function to work.
     #Luckily, they are indeed guaranteed to be extremals
+    #println("cone:")
     c = Polymake.polytope.Cone(RAYS = genmat, GROUP = G)
     #This step is leaky; I have informed Polymake hopefully it will get fixed:
-    normals = eachrow(matrix(QQ,Polymake.polytope.representation_conversion_up_to_symmetry(c)))
+    #println("ddp:")
+    ntemp = Polymake.polytope.representation_conversion_up_to_symmetry(c)
+    #println("normals:")
+    normals = eachrow(matrix(QQ,ntemp))
+    #println("after:")
+    #finalize(normals)
+    #GC.enable(true)
+    #normals = eachrow(matrix(QQ,Polymake.polytope.representation_conversion_up_to_symmetry(c)))
+    #Try clean up to avoid errors:
+    #pa = nothing
+    #G = nothing
+    #genmat = nothing
+    #c = nothing
+    #ntemp = nothing
+    #GC.gc()
+    finalize(pa)
+    finalize(G)
+    finalize(genmat)
+    finalize(c)
+    finalize(ntemp)
+    finalize(normals)
+
+
     verbose && @printf(" | Orbits: %i ", length(normals))
     #These normals are w.r.t the standard inner product on R^n.  Here is dirty conversion.
     #Can't nec do a change of basis because the cholesky of V.space.gram has no reason to have rational entries 
@@ -632,63 +620,12 @@ function perfect_cone_normals(q::AbstractAlgebra.Generic.MatSpaceElem{T},V::Humb
 
     end
     fnorms = [humbert_to_mat(f,V.field) for f in fnorms]
-    return fnorms
-end
-
-"See `perfect_cone_normals`.  Use this when you expect more than 10,000 calls.
-    Certainly slower than the normal way"
-function perfect_cone_normals_worker(q::AbstractAlgebra.Generic.MatSpaceElem{T},V::HumbertSpace,
-        k::Int; class::Int = 1, verbose::Bool = false) where T <: NumFieldElem
-    vgens = perfect_cone_generators(q,V; class)
-    verbose && @printf " | Rays: %i " length(vgens)
-    conegens = [humbert_to_mat(r,V.field) for r in vgens]
-    gs = automorphism_group_generators(form_to_lattice(q,V; class))
-    if V isa ComplexHumbertSpace #Decide whether involution is needed
-        rgs = [[transpose(map(V.field.bar,g))*r*g for r in conegens] for g in gs]
-    else
-        rgs = [[transpose(g)*r*g for r in conegens] for g in gs]
-    end
-    #use rgs to make permutations
-    ps = [indexin(conegens,rg) for rg in rgs]
-    ps = [[x-1 for x in v] for v in ps]
-    #Make a worker we can kill later to avoid memory leak:
-    if (k-1)%10000 == 0
-        nprocs() != 1 && rmprocs(workers())
-        addprocs(1)
-        @eval using Nemo #load onto new worker
-        @eval using Polymake
-    end
-    #Asking for trouble if we create any Polymake objects outside the worker
-    genmat = permutedims(stack(vgens))
-    normalscomp = @spawnat :any begin  
-        pa = Polymake.group.PermutationAction(GENERATORS = :($ps))
-        pgenmat = Polymake.Matrix(:($genmat))
-        G = Polymake.group.Group(RAYS_ACTION = pa)
-        #We must force the input rays to be extremals to get the next function to work.
-        #Luckily, they are indeed guaranteed to be extremals
-        c = Polymake.polytope.Cone(RAYS = pgenmat, GROUP = G)
-        return [Nemo.QQ(x) for x in Polymake.polytope.representation_conversion_up_to_symmetry(c)]
-    end
-    normals = eachrow(fetch(normalscomp))
-    verbose && @printf(" | Orbits: %i ", length(normals))
-    #These normals are w.r.t the standard inner product on R^n.  Here is dirty conversion.
-    #Can't nec do a change of basis because the cholesky of V.space.gram has no reason to have rational entries 
-    #TODO proper change of base - could maybe scale all the rows separately to make it work?
-    #Test which rays are in each facet: 
-    my_is_perp = X -> (Y->dot(X,Y)==0)
-    indices_in_facets = Vector{Vector{Int64}}(undef,length(normals))
-    for i in eachindex(normals)
-        indices_in_facets[i] = findall(my_is_perp(normals[i]),vgens)
-    end
-    #Make the normals with the correct inner product
-    fnorms = [orthogonal_complement(V.space,matrix(QQ,transpose(stack(vgens[inds]))))[1,:] 
-        for inds in indices_in_facets]
-    #Get the right direction:
-    for i in eachindex(fnorms)
-        j = findfirst(!in(indices_in_facets[i]),eachindex(vgens))
-        fnorms[i] = sign(dot(vgens[j],V.space.gram,fnorms[i]))*fnorms[i]
-    end
-    fnorms = [humbert_to_mat(f,V.field) for f in fnorms]
+    #finalize(pa)
+    #finalize(G)
+    #finalize(genmat)
+    #finalize(c)
+    #finalize(normals)
+    #GC.enable(true)
     return fnorms
 end
 
@@ -697,25 +634,6 @@ end
 function perfect_neighbours(q::AbstractAlgebra.Generic.MatSpaceElem{T},V::HumbertSpace;
         class::Int = 1, verbose::Bool = false) where T <: NumFieldElem
     fs = perfect_cone_normals(q,V; class, verbose)
-    verbose && print("| Lambdas: ")
-    verbose && print("\e[s")
-    verbose && print("...")
-    Q = trace_form(q,V.field; class)
-    lambdas = Vector{QQFieldElem}(undef,length(fs))
-    Threads.@threads for i in eachindex(lambdas)
-        lambdas[i] = find_lambda(Q,trace_form(fs[i],V.field; class))
-        verbose && @printf("\e[u%i",i)
-    end #could also compute the output over threads for small improvement
-    verbose && print("\e[u")
-    verbose && print(length(lambdas))
-    return [q+lambdas[i]*fs[i] for i in eachindex(fs)]
-end
-
-"See `perfect_neighbours`.  Use this when you expect more than 10,000 calls.
-    Certainly slower than the normal way"
-function perfect_neighbours_worker(q::AbstractAlgebra.Generic.MatSpaceElem{T},V::HumbertSpace;
-        class::Int = 1, verbose::Bool = false) where T <: NumFieldElem
-    fs = perfect_cone_normals_worker(q,V; class, verbose)
     verbose && print("| Lambdas: ")
     verbose && print("\e[s")
     verbose && print("...")
@@ -787,60 +705,6 @@ function enumerate_perfect_forms(V::HumbertSpace, class::Int = 1;
     return [p.mat for p in forms]
 end
 
-"See `enumerate_perfect_forms(V,class)`.  Use this when you expect more than 10,000 calls.
-    Certainly slower than the normal way"
-function enumerate_perfect_forms_worker(V::HumbertSpace, class::Int = 1;
-        input = nothing, output = nothing, verbose::Bool = true)
-    if input === nothing
-        initial = iso_ctx_init(initial_perfect_form(V; class),V; class) 
-        forms = field_conjugates(initial,V; class) #Includes field conjugates
-        noconj = [1] #picks representatves of forms up to field automorphism
-        counter = 0
-    else 
-        class, counter, noconj, forms = load_form_data(V,input; iso = true)
-    end
-    #Keep checking new forms
-    while counter < length(noconj)
-        counter = counter+1
-        verbose && @printf("Forms: %i | Number: %i ", length(noconj), counter)
-        newforms = [iso_data_init(q,V; class) for q in 
-            perfect_neighbours_worker(forms[noconj[counter]].mat,V; class,verbose)]
-        verbose && print(" | Isometry: \e[s")
-        for i in eachindex(newforms)
-            verbose && @printf("\e[u%i",i)
-            #Only consider those with the same scalars:
-            filtered = forms |> Transducers.Filter(X->X.scalars == newforms[i].scalars) |> 
-                Transducers.Map(X->X.ctx.max)
-            #Find the maximum length of short vectors needed:
-            bound = Transducers.foldxt(max, filtered; init = 0)
-            if bound == 0 #...then we already know it's a new form
-                formtoadd = FormCtx(newforms[i].mat, newforms[i].scalars, 
-                    (my_init_small(newforms[i].Zgram;)))
-                push!(noconj,lastindex(forms)+1) #Add the one form to `noconj`
-                #Add all conjugates to the full list:
-                forms = vcat(forms,field_conjugates(formtoadd,V; class)) 
-            else #...we have to actually check the isometries
-                #Sorted to make it easier to truncate:
-                shortvectors = (bound, sort(Hecke._short_vectors_gram_integral(Vector, 
-                    newforms[i].Zgram[1], bound, Int; is_lll_reduced_known = true), by = last))
-                lazyisom = Transducers.Map(X -> my_isometry(newforms[i], X, shortvectors))(forms)
-                if !Transducers.foldxt(Transducers.right, Transducers.ReduceIf(identity),
-                        lazyisom; init=false) #fancy way of parallel checking
-                    formtoadd = FormCtx(newforms[i].mat, newforms[i].scalars,
-                        (my_init_small(newforms[i].Zgram; shortvecs=shortvectors)))
-                    push!(noconj,lastindex(forms)+1) #Add the one form to `noconj`
-                    #Add all conjugates to the full list:
-                    forms = vcat(forms,field_conjugates(formtoadd,V; class))
-                end
-            end
-        end
-        output !== nothing && save(output,(class,counter,noconj,[p.mat for p in forms]))
-        verbose && print("\n")
-    end
-    return [p.mat for p in forms]
-end
-
-
 "Finds the perfect forms in `V` for each Steinitz class of lattice.
     Only use this for small examples; it's easy to run out of memory with bigger ones.
     For large examples, compute and save to disk one at a time instead.
@@ -849,13 +713,6 @@ function enumerate_perfect_forms(V::HumbertSpace)
     #As far as I can tell, list comprehension isn't too slow
     return [enumerate_perfect_forms(V,i) for i in eachindex(V.field.ideals)]
 end
-
-"See `enumerate_perfect_forms(V)`.  Use this when you expect more than 10,000 calls.
-    You probably should be computing classes one at a time if 10,000 is a concern"
-function enumerate_perfect_forms_worker(V::HumbertSpace)
-    return [enumerate_perfect_forms_worker(V,i) for i in eachindex(V.field.ideals)]
-end
-
 
 "EXPERIMENTAL: Takes file as output by `enumerate_perfect_forms`
     and makes sure its compatible with `V`.  
@@ -892,7 +749,7 @@ end
 function load_form_data(V::RealHumbertSpace,filename::String; iso::Bool = false)
     class, counter, noconjugates, mats = load(filename)
     #Convert to make mats work with `V`:
-    K = V.field
+    K = V.field.r
     L = parent(mats[1][1,1])
     fl, LKmap = is_isomorphic_with_map(L, K)
     map!(X->LKmap.(X), mats)
@@ -989,7 +846,7 @@ end
     Returns a list of `FormCtx`'s, up to isometry"
 function field_conjugates(p::FormCtx,V::HumbertSpace; class::Int = 1)
     formslist = [p]
-    if length(V.field.abs_autos) > 1 #Only if there actually are automorphisms
+    if length(V.field.abs_autos) > 1 && class == 1 #Only if there actually are automorphisms
         #Same logic as in `enumerate_perfect_forms`; reducing the list up to isomorphism:
         newforms = [iso_data_init(map(a,p.mat),V;class = class) for a in V.field.abs_autos[2:end]]
         for i in range(1,length(newforms))
@@ -1050,8 +907,6 @@ function V_init(n::Int, coeffs::Vector{Int})
     #pol = x^4 - 17*x^2 + 36
     return V
 end
-
-#Test functions pay no heed:
 
 
 
